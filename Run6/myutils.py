@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 from lsst.obs.lsst import LsstCam
 from matplotlib import pyplot as plt
+from matplotlib import lines
 from mpl_toolkits import axes_grid1
 from matplotlib import collections
 from astropy.time import Time
@@ -67,12 +68,20 @@ def get_rtmtype():
                 'R41':'itl','R42':'itl','R43':'itl'}
     return rtm_type
 
+#def get_allrtmtype():
+#    rtm_type = {'R00':'itl','R01':'itl','R02':'itl','R03':'itl','R04':'itl',
+#                'R10':'itl','R11':'e2v','R12':'e2v','R13':'e2v','R14':'e2v',
+#                'R20':'itl','R21':'e2v','R22':'e2v','R23':'e2v','R24':'e2v',
+#                'R30':'e2v','R31':'e2v','R32':'e2v','R33':'e2v','R34':'e2v',
+#                'R40':'itl','R41':'itl','R42':'itl','R43':'itl','R44':'itl'}
+#    return rtm_type
+
 def get_allrtmtype():
-    rtm_type = {'R00':'itl','R01':'itl','R02':'itl','R03':'itl','R04':'itl',
+    rtm_type = {'R00':'corner','R01':'itl','R02':'itl','R03':'itl','R04':'corner',
                 'R10':'itl','R11':'e2v','R12':'e2v','R13':'e2v','R14':'e2v',
                 'R20':'itl','R21':'e2v','R22':'e2v','R23':'e2v','R24':'e2v',
                 'R30':'e2v','R31':'e2v','R32':'e2v','R33':'e2v','R34':'e2v',
-                'R40':'itl','R41':'itl','R42':'itl','R43':'itl','R44':'itl'}
+                'R40':'corner','R41':'itl','R42':'itl','R43':'itl','R44':'corner'}
     return rtm_type
 
 def get_slots_per_bay(abay,BOTnames=True):
@@ -166,6 +175,13 @@ def get_segment(amp):
 def get_segments(amps):
     segments = [get_segment(amp) for amp in amps]
     return segments
+
+def get_segments_bydet(idet):
+    seglist = []
+    accd = camera[idet]
+    for anamp in accd:
+        seglist.append(anamp.getName())
+    return seglist
 
 def bayslot_segments(bayslot):
     """ return list of segments, in order, given the bayslot
@@ -414,10 +430,66 @@ def get_raw(raw0,skippre=True):
         
     return raw,data,serial_overscan,parallel_overscan
 
-# 
-# Summary Information from the Butler
 #
-def eopipe_DictToDf(amp_data):
+# Bias Stability information from the Butler
+#
+def calc_biasstability_rms(biasstab):
+
+    rtmtype = get_allrtmtype()
+    
+    bay_slot = []
+    bay_type = []
+    segment = []
+    rms = []
+    rc_rms = []
+    for idet in det_names.keys():
+        bayslot_name = det_names[idet]
+        bay = bayslot_name[0:3]
+            
+        df_bayslot = biasstab[idet]
+        
+        for seg in get_segments_bydet(idet):            
+            df_C = df_bayslot[(df_bayslot.amp_name==seg)]
+            
+            bay_slot.append(bayslot_name)
+            bay_type.append(rtmtype[bay])
+            segment.append(seg)
+            rms.append(np.std(df_C['mean']))
+            rc_rms.append(np.std(df_C['rc_mean']))           
+
+    dbias = {}
+    dbias['bay_slot'] = bay_slot
+    dbias['type'] = bay_type
+    dbias['segment'] = segment
+    dbias['rms'] = rms
+    dbias['rc_rms'] = rc_rms
+
+    # fill 
+    df = pd.DataFrame(dbias)
+    df.columns = df.columns.str.upper()
+    return df        
+
+
+# 
+# EoPipe Summary Information from the Butler
+#
+def fix_keys(amp_data):
+    
+    fixed_data = amp_data.copy()
+    datakeys = list(amp_data.keys())
+    keylut = {'SDSSi':'HIGH','SDSSi~ND_OD1.0':'LOW'}  # set these by hand
+    for akey in datakeys:
+        if type(akey) is tuple:
+            if akey[1] in keylut:
+                suffix = keylut[akey[1]]
+            else:
+                suffix = akey[1]
+            newkey = akey[0]+"_"+suffix
+            fixed_data[newkey] = fixed_data.pop(akey)
+
+    return fixed_data
+
+def eopipe_DictToDfz(amp_data):
     """ convert summary data from amp_data to a dataframe    
     """
     
@@ -425,14 +497,21 @@ def eopipe_DictToDf(amp_data):
     rtmtypes = get_allrtmtype()
     cornerbays = get_crtms()
     
-    
-    # here are all the data keys
+    # here are all the data keys, need to fix the ones that are tuples
+    amp_data = fix_keys(amp_data)
     datakeys = amp_data.keys()
-    
+        
     # get set of bayslot's present in any of the keys
     bayslot_set = {}
     for akey in datakeys:
+        keyset = amp_data[akey]
+        for bayslot in keyset:
+            if type(bayslot)==int:
+                print(akey,bayslot)
+            #if len(bayslot)!=7:
+            #    print(akey,bayslot)
         bayslot_set =  bayslot_set | amp_data[akey].keys()
+    print(bayslot_set)
     bayslot_list = sorted(list(bayslot_set))
         
     # output dictionary
@@ -489,3 +568,59 @@ def eopipe_DictToDf(amp_data):
     df = pd.DataFrame(cdf)
     df.columns = df.columns.str.upper()
     return df
+
+# Plotting methods
+
+def compare_tworuns(df1,df2,run1,run2,minxy,maxxy,quantity='READ_NOISE',draw_line=True,legend_loc='lower right',scale='linear',save=None):
+
+    rtms = get_rtms()
+    crtms = get_crtms()
+    rtmids = get_rtmids()
+    allrtms = rtms + crtms
+
+    f,ax = plt.subplots(5,5,figsize=(22,22),constrained_layout=True)
+    axf = ax
+
+    for i,abay in enumerate(allrtms):
+
+        thertm = rtmids[abay]
+        ix = 4-int(abay[1:2])
+        iy = int(abay[2:3])
+
+        # get the desired quantity, filtered by raft
+        df1f = df1[df1.BAY==abay]
+        df2f = df2[df2.BAY==abay]
+
+        for aslot in get_slots_per_bay(abay):
+
+            # filter by slot
+            df1fs = df1f[df1f.SLOT==aslot]
+            df2fs = df2f[df2f.SLOT==aslot]
+
+            quant1 = df1fs[quantity]
+            quant2 = df2fs[quantity]
+
+            # make sure we have entries
+            if len(quant1)>0 and len(quant1)==len(quant2):
+                axf[ix,iy].scatter(quant1,quant2,label=aslot)
+
+
+        axf[ix,iy].text(0.07,0.9,'%s %s' % (abay,thertm),transform=axf[ix,iy].transAxes)
+        axf[ix,iy].set_xlabel('%s Run %s' % (quantity,run1))
+        axf[ix,iy].set_ylabel('%s Run %s' % (quantity,run2))
+
+        axf[ix,iy].set_xlim(minxy,maxxy)
+        axf[ix,iy].set_ylim(minxy,maxxy)
+
+        ax[ix,iy].set_xscale(scale)
+        ax[ix,iy].set_yscale(scale)
+
+        if (ix==0 and iy==0) or (ix==0 and iy==1):
+            axf[ix,iy].legend(loc=legend_loc)
+
+        if draw_line:
+            line = lines.Line2D([minxy,maxxy], [minxy,maxxy], lw=2., color='r', alpha=0.4)
+            axf[ix,iy].add_line(line)
+            
+    if save:
+        f.savefig(save)
