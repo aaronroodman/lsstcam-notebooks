@@ -11,6 +11,13 @@ from astropy.time import Time
 from astropy.io import fits
 import time
 
+import lsst.daf.butler as daf_butler
+import lsst.afw.math as afw_math
+from lsst.obs.lsst import LsstCam, LsstTS8
+import lsst.eo.pipe as eo_pipe
+from lsst.eo.pipe import (readNoiseTask, darkCurrentTask, defectsTask,
+                          eperTask, divisaderoTearingTask, ptcPlotsTask,
+                          linearityPlotsTask, bfAnalysisTask)
 
 
 #
@@ -277,7 +284,7 @@ def get_metadata(butler,dsrefs,keys):
 
     print("Number of images: ",len(dsrefs))
     for i,aref in enumerate(dsrefs):
-        rawmeta = butler.getDirect(aref.makeComponentRef("metadata"))
+        rawmeta = butler.get(aref.makeComponentRef("metadata"))
         for akey in keys:
             dfdictm[akey].append(rawmeta[akey])
         
@@ -286,7 +293,8 @@ def get_metadata(butler,dsrefs,keys):
     print('Total time: ',edtime-sttime)
 
     dfmeta = pd.DataFrame(dfdictm)
-    return dfmeta
+    dfmetas = dfmeta.sort_values(by=['MJD-BEG'],ignore_index=True)  #better have MJD-BEG in keys
+    return dfmetas
 
 # get metadata right from the Headers using fits IO
 def get_headerdata(butler,dsrefs,keys):
@@ -311,6 +319,84 @@ def get_headerdata(butler,dsrefs,keys):
 
     dfmeta = pd.DataFrame(dfdictm)
     return dfmeta
+
+# get eo_pipe output
+def get_run_data(acq_run,weekly='w_2023_24',operator='lsstccs',repo='/repo/ir2',verbose=0):
+    
+    # We use the collection naming scheme to find all of the chained collections for an eo_pipe analysis of 
+    # the specified run.  For our dataset queries, we'll use these collections.
+    butler = daf_butler.Butler(repo)
+    collections = butler.registry.queryCollections(f"u/{operator}/*_{acq_run}_{weekly}",
+                                               collectionTypes=daf_butler.CollectionType.CHAINED)
+    if verbose>0:
+        for item in collections:
+            print(item)
+            
+    # Several eo_pipe pipelines produce per-amp measurements for all of the CCDs in the current Camera object.
+    # For LSSTCam, this would include all 205 CCDs in the focal plane; for TS8, this would be the 9 CCDs in 
+    # the raft installed at that test stand (currently RTM-004).
+    #
+    # The `eo_pipe.get_amp_data` function will retrieve these per-amp measurements and return them as a 
+    # three-level dictionary, keyed by measurement quantity, CCD (labeled by R**_S for LSSTCam), and 
+    # amplifier data (labeled by channel name, e.g., 'C01').
+    #
+    # The '[ps]cti' quantities are measured from combined flats, so will have different values depending on the
+    # filter used, since combined flats a created separately for each filter combination.
+    amp_data = eo_pipe.get_amp_data(repo, collections)
+    if verbose>0:
+        for quantity in amp_data.keys():
+            print(quantity)
+            
+    df_data = eopipe_DictToDfz(amp_data)
+    if verbose>0:
+        print(df_data.columns)
+        
+    return amp_data,df_data
+
+# convert to amp_data format
+def to_amp_data(df,name):
+    
+    outdict = {}
+    for index, row in df.iterrows():
+        if row.BAY_SLOT not in outdict:
+            outdict[row.BAY_SLOT] = {}
+            
+        outdict[row.BAY_SLOT][row.SEGMENT] = row[name]
+    return outdict
+
+# get bias stability data
+def get_run_biasstab(acq_run,weekly='w_2023_24',operator='lsstccs',repo='/repo/ir2',verbose=0):
+    
+    # We use the collection naming scheme to find all of the chained collections for an eo_pipe analysis of 
+    # the specified run.  For our dataset queries, we'll use these collections.
+    butler = daf_butler.Butler(repo)
+    collections = butler.registry.queryCollections(f"u/{operator}/eo_*_{acq_run}_{weekly}",
+                                               collectionTypes=daf_butler.CollectionType.CHAINED)    
+    butler_collections = daf_butler.Butler(repo, collections=collections)
+    
+    if verbose>0:
+        for item in collections:
+            print(item)
+            
+    biasstab = {}
+    for i in range(205):
+        biasstab[i] = butler_collections.get('bias_stability_stats',detector=i)
+
+    if verbose>0:
+        key = 98
+        if key in biasstab:
+            biasstab[98].columns        
+            df_98 = biasstab[98]
+            print(tabulate(df_98[(df_98.amp_name=='C10')],headers = 'keys', tablefmt = 'psql',floatfmt='0.3f'))
+            print(len(df_98[(df_98.amp_name=='C10')]))
+            
+    df_bias = calc_biasstability40_rms(biasstab)
+    
+    amp_biasdata = {}
+    amp_biasdata['RMS_S'] = to_amp_data(df_bias,'RMS_S')
+    amp_biasdata['RC_RMS_S'] = to_amp_data(df_bias,'RC_RMS_S')
+        
+    return biasstab,df_bias,amp_biasdata
 
 #
 # Display methods
@@ -469,6 +555,51 @@ def calc_biasstability_rms(biasstab):
     df.columns = df.columns.str.upper()
     return df        
 
+def calc_biasstability40_rms(biasstab_s):
+
+    rtmtype = get_allrtmtype()
+    
+    bay_slot = []
+    bay_type = []
+    segment = []
+    rms_s = []
+    rc_rms_s = []
+
+    for idet in det_names.keys():
+        bayslot_name = det_names[idet]
+        bay = bayslot_name[0:3]
+            
+        dfs_bayslot = biasstab_s[idet]
+        
+        for seg in get_segments_bydet(idet):            
+            dfs_C = dfs_bayslot[(dfs_bayslot.amp_name==seg)]
+            
+            # select 20 first and 20 last BIASes
+            dfs_Csort = dfs_C.sort_values(by=['mjd'],ignore_index=True)
+            maxindex = len(dfs_Csort)
+            select = (dfs_Csort.index<20) | (dfs_Csort.index>maxindex-20)
+            df_use = dfs_Csort[select]
+            
+            bay_slot.append(bayslot_name)
+            bay_type.append(rtmtype[bay])
+            segment.append(seg)
+            
+            rms_s.append(np.std(df_use['mean']))
+            rc_rms_s.append(np.std(df_use['rc_mean']))           
+ 
+
+    dbias = {}
+    dbias['bay_slot'] = bay_slot
+    dbias['type'] = bay_type
+    dbias['segment'] = segment
+    dbias['rms_s'] = rms_s
+    dbias['rc_rms_s'] = rc_rms_s
+
+    # fill 
+    df = pd.DataFrame(dbias)
+    df.columns = df.columns.str.upper()
+    return df        
+
 
 # 
 # EoPipe Summary Information from the Butler
@@ -511,7 +642,7 @@ def eopipe_DictToDfz(amp_data):
             #if len(bayslot)!=7:
             #    print(akey,bayslot)
         bayslot_set =  bayslot_set | amp_data[akey].keys()
-    print(bayslot_set)
+    #print(bayslot_set)
     bayslot_list = sorted(list(bayslot_set))
         
     # output dictionary
@@ -568,6 +699,9 @@ def eopipe_DictToDfz(amp_data):
     df = pd.DataFrame(cdf)
     df.columns = df.columns.str.upper()
     return df
+
+
+
 
 # Plotting methods
 
