@@ -13,6 +13,7 @@ import time
 
 import lsst.daf.butler as daf_butler
 import lsst.afw.math as afw_math
+import lsst.afw.cameraGeom
 from lsst.obs.lsst import LsstCam, LsstTS8
 import lsst.eo.pipe as eo_pipe
 from lsst.eo.pipe import (readNoiseTask, darkCurrentTask, defectsTask,
@@ -27,8 +28,10 @@ from lsst.eo.pipe import (readNoiseTask, darkCurrentTask, defectsTask,
 camera = LsstCam.getCamera()
 det_names = {i: det.getName() for i, det in enumerate(camera)}
 det_nums = {det.getName():i for i, det in enumerate(camera)}
+det_ptypes = {i: det.getPhysicalType() for i, det in enumerate(camera)}
+segments = [amp.getName() for amp in camera[1].getAmplifiers()]  #these are in order of amp
 
-segments = ['C%02d' % (i) for i in list(range(7+1)) + list(range(10,17+1))]
+#segments = ['C%02d' % (i) for i in list(range(7+1)) + list(range(10,17+1))]
 corner_bayslots = ['R00_SW0','R00_SW1','R00_SG0','R00_SG1']
 
 def get_slots():
